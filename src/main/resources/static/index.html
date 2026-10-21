@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CabGo</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+<script src="https://js.stripe.com/v3/"></script>
+<style>.card{background:#fff;border-radius:.75rem;padding:.9rem;box-shadow:0 1px 3px #0002}input,select,textarea{border:1px solid #cbd5e1;border-radius:.4rem;padding:.35rem .5rem;width:100%}button.b{background:#0f172a;color:#fff;border-radius:.4rem;padding:.35rem .8rem;margin:.15rem .15rem 0 0}button.r{background:#dc2626}button.g{background:#16a34a}</style></head>
+<body class="bg-slate-100 text-slate-800">
+<header class="bg-slate-900 text-white p-3 flex justify-between items-center"><b>🚖 CabGo</b><span><span id="who"></span> <button id="out" class="hidden underline ml-3" onclick="logout()">Logout</button></span></header>
+<main class="max-w-6xl mx-auto p-3 grid md:grid-cols-2 gap-3">
+<section id="auth" class="card md:col-span-2 max-w-md mx-auto w-full space-y-2">
+  <h2 class="font-bold">Login / Register</h2>
+  <input id="name" placeholder="Name (register)"><input id="email" placeholder="Email"><input id="pw" type="password" placeholder="Password (min 8)">
+  <input id="phone" placeholder="Phone"><select id="role"><option value="rider">Rider</option><option value="driver">Driver</option></select>
+  <input id="veh" placeholder="Vehicle model (drivers)"><input id="plate" placeholder="Plate (drivers)">
+  <div><button class="b" onclick="login()">Login</button><button class="b g" onclick="register()">Register</button> <a class="text-blue-600 underline text-sm" href="/oauth2/authorization/google">Sign in with Google</a></div>
+  <p class="text-xs text-slate-500">Admin demo: admin@cab.com / Admin@123</p>
+</section>
+<section id="mapbox" class="card hidden"><div id="map" style="height:430px"></div><p id="hint" class="text-sm mt-1"></p></section>
+<section id="panel" class="space-y-3 hidden"></section>
+</main>
+<script>
+let T=localStorage.token,me,map,mk={},ws,stripe,card,cfg,sel={};
+const $=s=>document.querySelector(s),fmt=n=>'₹'+Number(n).toFixed(2);
+function toast(t){const d=document.createElement('div');d.className='fixed top-3 right-3 bg-black text-white px-3 py-2 rounded z-[9999]';d.textContent=t;document.body.append(d);setTimeout(()=>d.remove(),4500)}
+async function api(p,m='GET',b){const r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json',...(T?{Authorization:'Bearer '+T}:{})},body:b?JSON.stringify(b):undefined});
+ if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error||('HTTP '+r.status))}
+ return (r.headers.get('content-type')||'').includes('json')?r.json():r.blob()}
+const run=f=>async(...a)=>{try{await f(...a)}catch(e){toast(e.message)}};
+function auth(res){T=res.token;localStorage.token=T;init()}
+const login=run(async()=>auth(await api('/auth/login','POST',{email:$('#email').value,password:$('#pw').value})));
+const register=run(async()=>auth(await api('/auth/register/'+$('#role').value,'POST',{name:$('#name').value,email:$('#email').value,password:$('#pw').value,phone:$('#phone').value,vehicleModel:$('#veh').value,plate:$('#plate').value})));
+function logout(){localStorage.removeItem('token');location.href='/'}
+function connect(subs){ws&&ws.deactivate();ws=new StompJs.Client({webSocketFactory:()=>new SockJS('/ws'),connectHeaders:{Authorization:'Bearer '+T},reconnectDelay:5000,
+ onConnect:()=>subs.forEach(([d,f])=>ws.subscribe(d,m=>f(JSON.parse(m.body))))});ws.activate()}
+function marker(k,ll,label,color){if(mk[k])mk[k].setLatLng(ll);else mk[k]=L.circleMarker(ll,{radius:9,color,fillOpacity:.8}).addTo(map).bindTooltip(label);}
+function clearM(k){if(mk[k]){map.removeLayer(mk[k]);delete mk[k]}}
+async function init(){
+ const q=new URLSearchParams(location.search).get('token');if(q){T=q;localStorage.token=q;history.replaceState({},'','/')}
+ if(!T)return;
+ try{me=await api('/me')}catch(e){localStorage.removeItem('token');T=null;return}
+ $('#auth').classList.add('hidden');['#mapbox','#panel','#out'].forEach(s=>$(s).classList.remove('hidden'));$('#who').textContent=me.name+' ('+me.role+')';
+ map=L.map('map').setView([28.61,77.21],12);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
+ navigator.geolocation&&navigator.geolocation.getCurrentPosition(p=>map.setView([p.coords.latitude,p.coords.longitude],14));
+ cfg=await api('/payments/config');if(!cfg.demo&&cfg.publishableKey)stripe=Stripe(cfg.publishableKey);
+ ({RIDER:rider,DRIVER:driver,ADMIN:admin})[me.role]();
+}
+/* ================= RIDER ================= */
+function rider(){
+ $('#hint').textContent='Click map: 1st click = pickup, 2nd click = drop.';
+ map.on('click',run(async e=>{ if(!sel.p||sel.d){sel={p:e.latlng};clearM('d');marker('p',e.latlng,'Pickup','green');$('#est').textContent='Pickup set. Click drop.'}
+  else{sel.d=e.latlng;marker('d',e.latlng,'Drop','red');const r=await api('/rides/estimate','POST',{pickupLat:sel.p.lat,pickupLng:sel.p.lng,dropLat:e.latlng.lat,dropLng:e.latlng.lng});
+   sel.est=r;$('#est').textContent=`${r.distanceKm} km · ETA ${r.etaMinutes} min · ${fmt(r.fare)}`;L.polyline([sel.p,sel.d],{color:'#2563eb'}).addTo(map)}}));
+ $('#panel').innerHTML=`<div class="card"><h3 class="font-bold">Book a ride</h3><p id="est" class="my-1 text-sm">Select pickup &amp; drop on the map.</p>
+  <input id="promo" placeholder="Promo code (try WELCOME10)"><button class="b" onclick="book()">Book now</button></div>
+  <div id="active"></div><div class="card"><h3 class="font-bold">Ride history</h3><div id="hist" class="text-sm"></div></div>
+  <div class="card"><h3 class="font-bold">Support</h3><input id="ts" placeholder="Subject"><textarea id="tm" placeholder="Message"></textarea><button class="b" onclick="ticket()">Send</button></div>`;
+ refreshRider()}
+const book=run(async()=>{if(!sel.d)throw new Error('Pick pickup and drop first');
+ await api('/rides','POST',{pickupLat:sel.p.lat,pickupLng:sel.p.lng,dropLat:sel.d.lat,dropLng:sel.d.lng,pickupAddress:'Pin '+sel.p.lat.toFixed(4)+','+sel.p.lng.toFixed(4),dropAddress:'Pin '+sel.d.lat.toFixed(4)+','+sel.d.lng.toFixed(4),promoCode:$('#promo').value});refreshRider()});
+const ticket=run(async()=>{await api('/support','POST',{subject:$('#ts').value,message:$('#tm').value});toast('Ticket submitted')});
+async function refreshRider(){
+ const h=await api('/rides');const cur=h.find(r=>['REQUESTED','ACCEPTED','ARRIVED','IN_PROGRESS'].includes(r.status))||h.find(r=>r.status==='COMPLETED'&&(!r.paid||!r.rated));
+ $('#hist').innerHTML=h.map(r=>`<div class="border-b py-1">#${r.id} ${r.status} ${fmt(r.fare)} <button class="underline" onclick="pdf(${r.id})">PDF</button> <button class="underline" onclick="mailR(${r.id})">Email</button></div>`).join('')||'No rides yet';
+ if(!cur){$('#active').innerHTML='';return}
+ const subs=[[`/topic/ride/${cur.id}`,v=>{const old=cur.status;if(v.status!==old)toast('Ride '+v.status.replace('_',' ').toLowerCase());refreshRider()}],[`/topic/ride/${cur.id}/location`,l=>marker('car',[l.lat,l.lng],'Driver','blue')],[`/topic/ride/${cur.id}/sos`,()=>toast('SOS alert sent')]];
+ if(!window._sub||window._sub!==cur.id+cur.status){window._sub=cur.id+cur.status;connect(subs)}
+ let a=`<div class="card"><h3 class="font-bold">Ride #${cur.id}: <span class="text-blue-600">${cur.status}</span></h3><p class="text-sm">${cur.distanceKm} km · ${fmt(cur.fare)}${cur.discount?` (saved ${fmt(cur.discount)})`:''}</p>${cur.driverName?`<p>Driver: ${cur.driverName} · ${cur.vehicle} · ${cur.plate}</p>`:'<p>Finding nearby drivers…</p>'}`;
+ if(['REQUESTED','ACCEPTED','ARRIVED'].includes(cur.status))a+=`<button class="b r" onclick="cancelR(${cur.id})">Cancel</button>`;
+ if(cur.driverId&&cur.status!=='COMPLETED')a+=`<button class="b r" onclick="sos(${cur.id})">🆘 SOS</button>`;
+ if(cur.status==='COMPLETED'&&!cur.paid){a+=cfg.demo?`<button class="b g" onclick="pay(${cur.id})">Pay ${fmt(cur.fare)} (demo)</button>`:`<div id="card" class="border p-2 my-1"></div><button class="b g" onclick="pay(${cur.id})">Pay ${fmt(cur.fare)}</button>`}
+ if(cur.status==='COMPLETED'&&cur.paid&&!cur.rated)a+=`<select id="st"><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option></select><input id="cm" placeholder="Feedback"><button class="b" onclick="rate(${cur.id})">Rate driver</button>`;
+ $('#active').innerHTML=a+'</div>';
+ if($('#card')&&stripe){card=stripe.elements().create('card');card.mount('#card')}}
+const cancelR=run(async id=>{await api(`/rides/${id}/cancel`,'POST');refreshRider()});
+const sos=run(async id=>{await api(`/rides/${id}/sos`,'POST');toast('SOS broadcast to admins')});
+const pay=run(async id=>{const i=await api(`/payments/ride/${id}/intent`,'POST');
+ if(i.clientSecret==='demo')await api(`/payments/ride/${id}/demo-confirm`,'POST');
+ else{const r=await stripe.confirmCardPayment(i.clientSecret,{payment_method:{card}});if(r.error)throw new Error(r.error.message);await new Promise(s=>setTimeout(s,2000))}
+ toast('Payment successful — receipt generated');refreshRider()});
+const rate=run(async id=>{await api(`/rides/${id}/rating`,'POST',{stars:+$('#st').value,comment:$('#cm').value});toast('Thanks for rating!');refreshRider()});
+const pdf=run(async id=>{const b=await api(`/rides/${id}/receipt`);const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=`receipt-${id}.pdf`;a.click()});
+const mailR=run(async id=>{await api(`/rides/${id}/email-receipt`,'POST');toast('Receipt e-mail queued')});
+/* ================= DRIVER ================= */
+async function driver(){
+ $('#hint').textContent='Click the map to set your current location (a real app would stream GPS).';
+ map.on('click',run(async e=>{await api('/driver/location','PUT',{lat:e.latlng.lat,lng:e.latlng.lng});marker('me',e.latlng,'You','blue');loadD()}));
+ $('#panel').innerHTML=`<div class="card" id="dash"></div><div class="card"><h3 class="font-bold">Ride requests</h3><div id="reqs"></div></div><div id="act"></div>
+  <div class="card"><h3 class="font-bold">Ratings</h3><div id="rts" class="text-sm"></div><h3 class="font-bold mt-2">History</h3><div id="dh" class="text-sm"></div></div>`;
+ const d=await api('/driver/dashboard');connect([[`/topic/driver/${d.driverId}`,v=>{toast('New ride request #'+v.id);loadD()}]]);loadD();setInterval(loadD,8000)}
+async function loadD(){
+ const d=await api('/driver/dashboard'),rq=await api('/driver/requests');
+ $('#dash').innerHTML=`<h3 class="font-bold">Dashboard</h3><p>Earnings <b>${fmt(d.earnings)}</b> · Rides ${d.completedRides} · ⭐ ${d.avgRating} (${d.ratingCount})</p><button class="b ${d.available?'r':'g'}" onclick="online(${!d.available})">${d.available?'Go offline':'Go online'}</button>`;
+ $('#reqs').innerHTML=rq.map(r=>`<div class="border-b py-1 text-sm">#${r.id} ${r.distanceKm} km · ${fmt(r.fare)} · ${r.rider}<br><button class="b g" onclick="dact(${r.id},'accept')">Accept</button><button class="b r" onclick="dact(${r.id},'reject')">Reject</button></div>`).join('')||'<p class="text-sm">None</p>';
+ const a=d.activeRide;$('#act').innerHTML=a?`<div class="card"><h3 class="font-bold">Active ride #${a.id}: ${a.status}</h3>${{ACCEPTED:`<button class="b" onclick="dact(${a.id},'arrived')">I've arrived</button>`,ARRIVED:`<button class="b" onclick="dact(${a.id},'start')">Start ride</button>`,IN_PROGRESS:`<button class="b g" onclick="dact(${a.id},'complete')">Complete ride</button>`}[a.status]}</div>`:'';
+ if(a){marker('p',[a.pickupLat,a.pickupLng],'Pickup','green');marker('d',[a.dropLat,a.dropLng],'Drop','red')}else{clearM('p');clearM('d')}
+ $('#rts').innerHTML=(await api('/driver/ratings')).map(r=>`<div>⭐${r.stars} ${r.comment}</div>`).join('')||'No ratings yet';
+ $('#dh').innerHTML=(await api('/driver/history')).map(r=>`<div>#${r.id} ${r.status} ${fmt(r.fare)}</div>`).join('')}
+const online=run(async v=>{await api('/driver/online?available='+v,'POST');loadD()});
+const dact=run(async(id,a)=>{await api(`/driver/rides/${id}/${a}`,'POST');loadD()});
+/* ================= ADMIN ================= */
+async function admin(){
+ $('#hint').textContent='Live SOS alerts appear here and as toasts.';
+ $('#panel').innerHTML=`<div class="card" id="st"></div><div class="card"><h3 class="font-bold">🆘 SOS alerts</h3><div id="sosl" class="text-sm"></div></div>
+  <div class="card"><h3 class="font-bold">Promo codes</h3><div id="pr" class="text-sm"></div><input id="pc" placeholder="CODE"><input id="pp" type="number" placeholder="% off"><button class="b" onclick="addPromo()">Add</button></div>
+  <div class="card"><h3 class="font-bold">Support tickets</h3><div id="tk" class="text-sm"></div></div><div class="card"><h3 class="font-bold">Driver ranking</h3><div id="rk" class="text-sm"></div></div>`;
+ connect([['/topic/sos',a=>{toast('SOS on ride #'+a.rideId+' by '+a.by);$('#sosl').insertAdjacentHTML('afterbegin',`<div class="text-red-600">Ride #${a.rideId} — ${a.by} — ${a.time}</div>`)}]]);loadA()}
+async function loadA(){
+ const s=await api('/admin/stats');$('#st').innerHTML=`<h3 class="font-bold">System</h3>${Object.entries(s).map(([k,v])=>`<span class="inline-block mr-3">${k}: <b>${k==='revenue'?fmt(v):v}</b></span>`).join('')}`;
+ $('#pr').innerHTML=(await api('/admin/promos')).map(p=>`<div>${p.code} — ${p.percentOff}%</div>`).join('');
+ $('#tk').innerHTML=(await api('/admin/tickets')).map(t=>`<div class="border-b py-1">#${t.id} [${t.status}] ${t.user}: <b>${t.subject}</b> — ${t.message} ${t.status==='OPEN'?`<button class="underline" onclick="resolveT(${t.id})">Resolve</button>`:''}</div>`).join('')||'None';
+ $('#rk').innerHTML=(await api('/drivers/ranking')).map(r=>`<div>${r.rank}. ${r.driver} ⭐${r.avgRating} (${r.ratings})</div>`).join('')||'No ratings yet'}
+const addPromo=run(async()=>{await api('/admin/promos','POST',{code:$('#pc').value,percentOff:+$('#pp').value});loadA()});
+const resolveT=run(async id=>{await api(`/admin/tickets/${id}/resolve`,'POST');loadA()});
+init();
+</script></body></html>
